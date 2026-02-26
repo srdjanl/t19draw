@@ -1,0 +1,16 @@
+{
+  "name": "t19draw",
+  "version": "1.0.0",
+  "description": "T19 Draw - Srpska online igra crtanja i pogadjanja",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
