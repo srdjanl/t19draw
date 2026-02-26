@@ -157,11 +157,6 @@ setInterval(()=>{wss.clients.forEach(ws=>{if(!ws.isAlive){ws.terminate();return;
 
 function handleMessage(ws,msg){
   const {type}=msg;
-  if(type==='reconnect'){
-    // Igrač se vraća sa starim ID-om
-    if(handleReconnect(ws, msg.playerId, msg.roomId)) return;
-    // Ako reconnect nije uspeo, tretirati kao novi join
-  }
   if(type==='createRoom'){
     const roomId=makeRoomId(); const playerId=makeId();
     const room=new Room(roomId,playerId); rooms.set(roomId,room);
@@ -173,19 +168,19 @@ function handleMessage(ws,msg){
   if(type==='joinRoom'){
     const room=rooms.get(msg.roomId?.toUpperCase());
     if(!room){ws.send(JSON.stringify({type:'error',msg:'Soba ne postoji. Proveri kod.'}));return;}
-    // Dozvoli ulaz i u toku igre (kao gledalac/kasni pridruženi)
+    if(room.phase!=='lobby'&&room.phase!=='gameEnd'){ws.send(JSON.stringify({type:'error',msg:'Igra je već u toku.'}));return;}
     const playerId=makeId(); clients.set(ws,{playerId,roomId:room.id});
     const pd={id:playerId,ws,name:msg.name||'Igrač',avatar:msg.avatar||'😊',score:0,connected:true};
     room.players.set(playerId,pd);
     room.broadcast({type:'playerJoined',player:{id:playerId,name:msg.name,avatar:msg.avatar,score:0},players:room.getPublicPlayers()});
-    ws.send(JSON.stringify({type:'joinedRoom',roomId:room.id,playerId,players:room.getPublicPlayers(),phase:room.phase,round:room.round,totalRounds:room.totalRounds,roundTime:room.roundTime,drawData:room.drawData,isHost:room.hostId===playerId}));
+    ws.send(JSON.stringify({type:'joinedRoom',roomId:room.id,playerId,players:room.getPublicPlayers(),phase:room.phase,round:room.round,totalRounds:room.totalRounds,roundTime:room.roundTime,drawData:room.drawData}));
     return;
   }
   const client=clients.get(ws); if(!client)return;
   const {playerId,roomId}=client; const room=rooms.get(roomId); if(!room)return;
   switch(type){
     case 'startGame':
-      if(playerId!==room.hostId){ws.send(JSON.stringify({type:'error',msg:'Samo domaćin može pokrenuti igru.'}));return;}
+      if(playerId!==room.hostId)return;
       if(!room.startGame())ws.send(JSON.stringify({type:'error',msg:'Potrebna su najmanje 2 igrača.'}));
       break;
     case 'updateSettings':
@@ -211,90 +206,16 @@ function handleMessage(ws,msg){
       else{const p=room.players.get(playerId);const cm={type:'chat',playerId,name:p?.name||'?',avatar:p?.avatar||'😊',text:msg.text,ts:Date.now()};room.broadcast(cm);room.chat.push(cm);}
       break;
     case 'ping': ws.send(JSON.stringify({type:'pong'})); break;
-    case 'playAgain': if(playerId===room.hostId&&(room.phase==='lobby'||room.phase==='gameEnd')){room.startGame();} break;
+    case 'playAgain': if(playerId===room.hostId&&(room.phase==='lobby'||room.phase==='gameEnd'))room.startGame(); break;
   }
 }
 
 function handleDisconnect(ws){
   const client=clients.get(ws); if(!client)return;
   const {playerId,roomId}=client; const room=rooms.get(roomId);
+  if(room){const p=room.players.get(playerId);if(p)p.connected=false;room.broadcast({type:'playerDisconnected',playerId,players:room.getPublicPlayers()});}
   clients.delete(ws);
-  if(!room)return;
-
-  const p=room.players.get(playerId);
-  if(p){ p.connected=false; p.ws=null; }
-
-  // ── 1. TRANSFER HOSTA ako je host ispao ──────────────────────
-  if(room.hostId===playerId){
-    const nextHost=[...room.players.values()].find(p=>p.connected!==false&&p.id!==playerId);
-    if(nextHost){
-      room.hostId=nextHost.id;
-      room.broadcast({type:'hostChanged',newHostId:nextHost.id,newHostName:nextHost.name});
-    }
-  }
-
-  // ── 2. Ako je crtač ispao, preskoči rundu ─────────────────────
-  if(room.phase==='drawing'&&room.currentDrawerId===playerId){
-    clearInterval(room.timer);
-    clearInterval(room.choiceTimer);
-    room.broadcast({type:'drawerLeft',players:room.getPublicPlayers()});
-    setTimeout(()=>{ if(rooms.get(roomId)) room.nextRound(); },2500);
-  }
-  // Ako je ispao tokom biranja reči, preskoči
-  else if(room.phase==='choosing'&&room.currentDrawerId===playerId){
-    clearInterval(room.choiceTimer);
-    room.broadcast({type:'drawerLeft',players:room.getPublicPlayers()});
-    setTimeout(()=>{ if(rooms.get(roomId)) room.nextRound(); },2000);
-  }
-  else {
-    // Obavesti ostale o ispadu
-    room.broadcast({type:'playerDisconnected',playerId,players:room.getPublicPlayers()});
-  }
-
-  // ── 3. Proveri da li je ostao samo 1 (ili niko) ───────────────
-  const connectedCount=[...room.players.values()].filter(p=>p.connected!==false).length;
-  if(connectedCount===0){
-    // Svi otišli — obriši sobu za 5min
-    setTimeout(()=>{ if(rooms.has(roomId)&&[...rooms.get(roomId).players.values()].filter(p=>p.connected!==false).length===0) rooms.delete(roomId); },300000);
-  } else if(connectedCount===1&&room.phase==='drawing'){
-    // Ostao samo jedan igrač, pauziraj igru
-    clearInterval(room.timer);
-    room.broadcast({type:'gameпаузed',reason:'Ostao samo jedan igrač.'});
-  }
-
-  // ── 4. Reconnect window — 60s da se isti igrač vrati ─────────
-  setTimeout(()=>{
-    const r=rooms.get(roomId); if(!r)return;
-    const pl=r.players.get(playerId);
-    if(pl&&pl.connected===false){
-      // Igrač se nije vratio, trajno ukloni
-      r.players.delete(playerId);
-      r.broadcast({type:'playerRemoved',playerId,players:r.getPublicPlayers()});
-    }
-  },60000);
-}
-
-// ── RECONNECT: igrač se vraća sa istim playerId ───────────────────
-function handleReconnect(ws, playerId, roomId){
-  const room=rooms.get(roomId); if(!room)return false;
-  const p=room.players.get(playerId); if(!p)return false;
-  // Poveži novi ws sa starim playerom
-  p.ws=ws; p.connected=true;
-  clients.set(ws,{playerId,roomId});
-  // Pošalji trenutno stanje igre
-  ws.send(JSON.stringify({
-    type:'reconnected', playerId, roomId,
-    players:room.getPublicPlayers(),
-    phase:room.phase, round:room.round,
-    totalRounds:room.totalRounds, roundTime:room.roundTime,
-    isHost:room.hostId===playerId,
-    drawData:room.drawData,
-    maskedWord:room.phase==='drawing'?(playerId===room.currentDrawerId?room.currentWord:(room._mask?room._mask.join(''):'')):null,
-    timeLeft:room.timeLeft,
-    drawerId:room.currentDrawerId
-  }));
-  room.broadcast({type:'playerReconnected',playerId,name:p.name,players:room.getPublicPlayers()},playerId);
-  return true;
+  setTimeout(()=>{const r=rooms.get(roomId);if(r&&[...r.players.values()].filter(p=>p.connected!==false).length===0)rooms.delete(roomId);},300000);
 }
 
 // ─── WORD DB ─────────────────────────────────────────────────────────────────
