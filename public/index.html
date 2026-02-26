@@ -482,39 +482,33 @@ let reconnectTimer = null;
 let isConnected = false;
 
 function connect() {
-  // Sprečava višestruke konekcije
   if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
 
   const connEl = document.getElementById('connecting');
   const connTxt = document.getElementById('conn-text');
   if (connEl) connEl.style.display = 'flex';
 
-  try {
-    ws = new WebSocket(WS_URL);
-  } catch(e) {
-    console.error('WS create error:', e);
-    scheduleReconnect();
-    return;
-  }
+  try { ws = new WebSocket(WS_URL); }
+  catch(e) { scheduleReconnect(); return; }
 
   ws.onopen = () => {
     isConnected = true;
-    const connEl = document.getElementById('connecting');
-    if (connEl) connEl.style.display = 'none';
+    document.getElementById('connecting').style.display = 'none';
 
-    // Prikaži start screen ako nije već prikazana neka soba
-    if (!myRoomId) {
-      showScreen('start-screen');
-      // Proveri URL za room kod
-      const params = new URLSearchParams(location.search);
-      const code = params.get('room');
-      if (code) {
-        document.getElementById('j-code').value = code.toUpperCase();
-        switchTab('join');
-      }
+    // Pokušaj reconnect sa sačuvanom sesijom
+    const savedId = sessionStorage.getItem('t19_playerId');
+    const savedRoom = sessionStorage.getItem('t19_roomId');
+    if (savedId && savedRoom && !myRoomId) {
+      // Imamo staru sesiju — pokušaj reconnect
+      send({ type: 'reconnect', playerId: savedId, roomId: savedRoom });
+      // Ako reconnect ne uspe za 2s, prikaži start screen
+      setTimeout(() => {
+        if (!myRoomId) showStartScreen();
+      }, 2000);
+    } else if (!myRoomId) {
+      showStartScreen();
     }
 
-    // Keep-alive ping svakih 15s
     clearInterval(pingInterval);
     pingInterval = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'ping'}));
@@ -526,29 +520,29 @@ function connect() {
     handleMsg(m);
   };
 
-  ws.onclose = (e) => {
+  ws.onclose = () => {
     isConnected = false;
     clearInterval(pingInterval);
-    console.log('WS closed, code:', e.code, 'reason:', e.reason);
-    // Prikaži reconnect poruku samo ako smo bili u sobi
-    if (myRoomId) {
-      notify('⚡ Veza prekinuta, pokušavam ponovo...', 'w');
-    }
+    if (myRoomId) notify('⚡ Veza prekinuta, pokušavam ponovo...', 'w');
     scheduleReconnect();
   };
 
-  ws.onerror = (e) => {
-    console.error('WS error:', e);
-    // Ne radimo ništa ovde, onclose će se okidati posle
-  };
+  ws.onerror = () => {};
 }
 
 function scheduleReconnect() {
   clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(() => {
-    console.log('Reconnecting...');
-    connect();
-  }, 2500);
+  reconnectTimer = setTimeout(() => connect(), 2500);
+}
+
+function showStartScreen() {
+  showScreen('start-screen');
+  const params = new URLSearchParams(location.search);
+  const code = params.get('room');
+  if (code) {
+    document.getElementById('j-code').value = code.toUpperCase();
+    switchTab('join');
+  }
 }
 
 function send(data) {
@@ -563,20 +557,62 @@ function handleMsg(m) {
     case 'roomCreated':
       myId = m.playerId; myRoomId = m.roomId; isHost = true;
       totalRounds = m.totalRounds; roundTime = m.roundTime;
+      // Sačuvaj sesiju za reconnect
+      sessionStorage.setItem('t19_playerId', myId);
+      sessionStorage.setItem('t19_roomId', myRoomId);
       showScreen('lobby-screen');
       updateLobby(m.players);
       setRoomCode(m.roomId);
       break;
     case 'joinedRoom':
-      myId = m.playerId; myRoomId = m.roomId; isHost = false;
+      myId = m.playerId; myRoomId = m.roomId; isHost = m.isHost || false;
       totalRounds = m.totalRounds; roundTime = m.roundTime;
+      sessionStorage.setItem('t19_playerId', myId);
+      sessionStorage.setItem('t19_roomId', myRoomId);
       showScreen('lobby-screen');
       updateLobby(m.players);
       setRoomCode(m.roomId);
-      // Replay draw history
-      if (m.drawData && canvas) {
-        m.drawData.forEach(d => replayDraw(d));
+      if (m.drawData && canvas) m.drawData.forEach(d => replayDraw(d));
+      // Ako igra već teče, prikaži game screen
+      if (m.phase === 'drawing' || m.phase === 'choosing') {
+        showScreen('game-screen');
+        addChat({name:'Sistema', text:'Pridružio si se igri koja je u toku!'}, true);
       }
+      break;
+    case 'reconnected':
+      myId = m.playerId; myRoomId = m.roomId;
+      isHost = m.isHost || false;
+      totalRounds = m.totalRounds; roundTime = m.roundTime;
+      notify('✅ Ponovo si konektovan!', 's');
+      if (m.phase === 'drawing' || m.phase === 'choosing') {
+        showScreen('game-screen');
+        if (m.drawData) m.drawData.forEach(d => replayDraw(d));
+        if (m.maskedWord) renderWord(m.maskedWord, m.drawerId === myId);
+        if (m.timeLeft) startClientTimer(m.timeLeft);
+        isDrawer = m.drawerId === myId;
+        setDrawerUI(isDrawer);
+      } else {
+        showScreen('lobby-screen');
+      }
+      updateLobby(m.players);
+      setRoomCode(m.roomId);
+      break;
+    case 'hostChanged':
+      if (m.newHostId === myId) {
+        isHost = true;
+        notify('👑 Ti si novi domaćin!', 's');
+        // Refresh lobby kontrole
+        updateLobby(null);
+      } else {
+        notify(`👑 ${m.newHostName} je novi domaćin`, 'i');
+      }
+      break;
+    case 'drawerLeft':
+      addChat({name:'Sistema', text:'Crtač je napustio igru. Prelazimo na sledeću rundu...'}, true);
+      updatePlayersStrip(m.players);
+      break;
+    case 'playerRemoved':
+      updatePlayersStrip(m.players);
       break;
     case 'playerJoined':
       updateLobby(m.players);
@@ -702,16 +738,19 @@ function setRoomCode(code) {
 }
 
 function updateLobby(players) {
-  const grid = document.getElementById('lobby-players');
-  document.getElementById('lobby-count').textContent = players.length;
-  grid.innerHTML = '';
-  players.forEach(p => {
-    const div = document.createElement('div');
-    div.className = 'player-card' + (p.isHost?' host':'') + (p.id===myId?' me':'');
-    div.innerHTML = `<div class="player-av">${p.avatar||'😊'}</div><div class="player-name">${p.name}</div><div class="player-badge">${p.isHost?'👑 Domaćin':p.id===myId?'Ti':'Igrač'}</div>`;
-    grid.appendChild(div);
-  });
-  // Host controls
+  if (players) {
+    const grid = document.getElementById('lobby-players');
+    document.getElementById('lobby-count').textContent = players.length;
+    grid.innerHTML = '';
+    players.forEach(p => {
+      const div = document.createElement('div');
+      div.className = 'player-card' + (p.isHost?' host':'') + (p.id===myId?' me':'');
+      const dim = p.connected===false ? ' style="opacity:.4"' : '';
+      div.innerHTML = `<div class="player-av"${dim}>${p.avatar||'😊'}</div><div class="player-name">${p.name}${p.connected===false?' 🔌':''}</div><div class="player-badge">${p.isHost?'👑 Domaćin':p.id===myId?'Ti':'Igrač'}</div>`;
+      grid.appendChild(div);
+    });
+  }
+  // Uvek osveži kontrole na osnovu isHost
   document.getElementById('host-settings').style.display = isHost ? 'block' : 'none';
   document.getElementById('start-btn').style.display = isHost ? 'flex' : 'none';
   document.getElementById('waiting-msg').style.display = isHost ? 'none' : 'block';
@@ -906,8 +945,10 @@ function updateSettings() {
 }
 
 function leaveRoom() {
+  sessionStorage.removeItem('t19_playerId');
+  sessionStorage.removeItem('t19_roomId');
   if (ws) ws.close();
-  location.reload();
+  location.href = location.pathname; // bez ?room= parametra
 }
 
 function playAgain() {
@@ -917,7 +958,9 @@ function playAgain() {
 }
 
 function goToMenu() {
-  location.reload();
+  sessionStorage.removeItem('t19_playerId');
+  sessionStorage.removeItem('t19_roomId');
+  location.href = location.pathname;
 }
 
 function sendChat() {
