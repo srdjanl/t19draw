@@ -28,7 +28,11 @@ const server = http.createServer((req, res) => {
   });
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ 
+  server,
+  perMessageDeflate: false, // Railway proxy kompatibilnost
+  clientTracking: true
+});
 const rooms = new Map();
 const clients = new Map();
 
