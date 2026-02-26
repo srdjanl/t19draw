@@ -249,7 +249,8 @@ select option{background:var(--s2);}
 <div id="connecting">
   <div class="brand" style="font-size:2rem;background:linear-gradient(135deg,#ff3e6c,#00d4ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">T19 DRAW</div>
   <div class="spin"></div>
-  <div style="color:var(--dim);font-size:.85rem;">Konektujem se...</div>
+  <div id="conn-text" style="color:var(--dim);font-size:.85rem;">Konektujem se na server...</div>
+  <button id="conn-retry" onclick="connect()" style="display:none;margin-top:8px;padding:10px 20px;background:var(--acc);color:#fff;border:none;border-radius:10px;font-family:'Syne',sans-serif;font-weight:700;cursor:pointer;">Pokušaj ponovo</button>
 </div>
 
 <!-- NOTIFS -->
@@ -422,9 +423,9 @@ select option{background:var(--s2);}
 // ═══════════════════════════════════════════════════════════════
 //  CONFIG + STATE
 // ═══════════════════════════════════════════════════════════════
-const WS_URL = location.protocol === 'https:'
-  ? 'wss://' + location.host
-  : 'ws://' + location.host;
+// Railway i slični hostinzi koriste isti host za WS
+// Mora biti wss:// kada je https://, ws:// kada je http://
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
 
 const AVATARS = ['😀','😎','🥸','🤩','😜','🥳','😏','🤓','👻','🐱','🐶','🦊','🐸','🦁','🐼','🤖','👾','🎃','🐲','🦄'];
 const COLORS = ['#000000','#ffffff','#ef4444','#f97316','#eab308','#22c55e','#3b82f6','#8b5cf6','#ec4899','#6b7280','#92400e','#065f46','#1e40af','#7c3aed','#fbbf24','#34d399','#60a5fa','#a78bfa','#f9a8d4','#06b6d4'];
@@ -476,28 +477,78 @@ requestWakeLock();
 // ═══════════════════════════════════════════════════════════════
 //  WEBSOCKET
 // ═══════════════════════════════════════════════════════════════
+let pingInterval = null;
+let reconnectTimer = null;
+let isConnected = false;
+
 function connect() {
-  ws = new WebSocket(WS_URL);
+  // Sprečava višestruke konekcije
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+
+  const connEl = document.getElementById('connecting');
+  const connTxt = document.getElementById('conn-text');
+  if (connEl) connEl.style.display = 'flex';
+
+  try {
+    ws = new WebSocket(WS_URL);
+  } catch(e) {
+    console.error('WS create error:', e);
+    scheduleReconnect();
+    return;
+  }
+
   ws.onopen = () => {
-    document.getElementById('connecting').style.display = 'none';
-    // Check URL for room code
-    const params = new URLSearchParams(location.search);
-    const code = params.get('room');
-    if (code) {
-      document.getElementById('j-code').value = code;
-      switchTab('join');
+    isConnected = true;
+    const connEl = document.getElementById('connecting');
+    if (connEl) connEl.style.display = 'none';
+
+    // Prikaži start screen ako nije već prikazana neka soba
+    if (!myRoomId) {
+      showScreen('start-screen');
+      // Proveri URL za room kod
+      const params = new URLSearchParams(location.search);
+      const code = params.get('room');
+      if (code) {
+        document.getElementById('j-code').value = code.toUpperCase();
+        switchTab('join');
+      }
     }
-    // Keep alive pings
-    setInterval(() => { if (ws.readyState === 1) ws.send(JSON.stringify({type:'ping'})); }, 15000);
+
+    // Keep-alive ping svakih 15s
+    clearInterval(pingInterval);
+    pingInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'ping'}));
+    }, 15000);
   };
+
   ws.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch { return; }
     handleMsg(m);
   };
-  ws.onclose = () => {
-    setTimeout(() => { connect(); }, 2000);
+
+  ws.onclose = (e) => {
+    isConnected = false;
+    clearInterval(pingInterval);
+    console.log('WS closed, code:', e.code, 'reason:', e.reason);
+    // Prikaži reconnect poruku samo ako smo bili u sobi
+    if (myRoomId) {
+      notify('⚡ Veza prekinuta, pokušavam ponovo...', 'w');
+    }
+    scheduleReconnect();
   };
-  ws.onerror = () => {};
+
+  ws.onerror = (e) => {
+    console.error('WS error:', e);
+    // Ne radimo ništa ovde, onclose će se okidati posle
+  };
+}
+
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    console.log('Reconnecting...');
+    connect();
+  }, 2500);
 }
 
 function send(data) {
@@ -1137,6 +1188,16 @@ document.addEventListener('keydown', e => {
 // ═══════════════════════════════════════════════════════════════
 initAvatars();
 connect();
+
+// Ako se ne konektuje za 8s, pokaži retry dugme
+setTimeout(() => {
+  if (!isConnected) {
+    const t = document.getElementById('conn-text');
+    const b = document.getElementById('conn-retry');
+    if (t) t.textContent = 'Ne mogu da se konektujem na server.';
+    if (b) b.style.display = 'block';
+  }
+}, 8000);
 </script>
 </body>
 </html>
